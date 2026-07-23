@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Training artifacts kept local
+experiments/**/checkpoints/
+experiments/**/images/
+experiments/**/logs/
+outputs/
+
+# Local/editor files
+.vscode/
+.idea/
+.DS_Store
