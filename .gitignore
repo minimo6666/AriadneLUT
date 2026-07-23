@@ -3,10 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# Training artifacts kept local
-experiments/**/checkpoints/
-experiments/**/images/
-experiments/**/logs/
+# Local training artifacts
+experiments/
 outputs/
 
 # Local/editor files
