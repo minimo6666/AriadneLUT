@@ -8,6 +8,7 @@ import os
 import random
 import sys
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -174,6 +175,8 @@ def save_stage2_checkpoint(
     global_step: int,
     best_psnr: float,
     cfg: Any,
+    next_batch_index: int = 0,
+    epoch_complete: bool = True,
 ) -> None:
     if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
         return
@@ -183,6 +186,8 @@ def save_stage2_checkpoint(
         "epoch": int(epoch),
         "global_step": int(global_step),
         "best_psnr": float(best_psnr),
+        "next_batch_index": int(next_batch_index),
+        "epoch_complete": bool(epoch_complete),
         "stage1_config": str(cfg.stage1.config),
         "stage1_checkpoint": str(cfg.stage1.checkpoint),
         "stage2_state_dict": unwrap_stage2_model(model).stage2_state_dict(),
@@ -191,7 +196,9 @@ def save_stage2_checkpoint(
         "scaler": scaler.state_dict(),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, path)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, path)
 
 
 def load_stage2_checkpoint(
@@ -348,7 +355,11 @@ def main() -> None:
             raise RuntimeError("DDP with NCCL requires CUDA")
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=device,
+            timeout=timedelta(minutes=3),
+        )
     else:
         device_name = str(cfg.device)
         if device_name.startswith("cuda") and not torch.cuda.is_available():
@@ -405,6 +416,9 @@ def main() -> None:
         model = DistributedDataParallel(
             stage2_model,
             device_ids=[local_rank],
+            bucket_cap_mb=10,
+            gradient_as_bucket_view=True,
+            static_graph=True,
             output_device=local_rank,
             broadcast_buffers=False,
             find_unused_parameters=False,
@@ -423,6 +437,9 @@ def main() -> None:
     )
 
     accumulation = max(int(cfg.data.gradient_accumulation_steps), 1)
+    latest_every_steps = max(
+        int(getattr(cfg.train, "latest_every_steps", 0)), 0
+    )
     batches_per_epoch = len(train_loader)
     if args.max_train_batches > 0:
         batches_per_epoch = min(batches_per_epoch, int(args.max_train_batches))
@@ -439,6 +456,7 @@ def main() -> None:
     scaler = GradScaler("cuda", enabled=amp_enabled)
 
     start_epoch = 0
+    resume_batch_index = 0
     global_step = 0
     best_psnr = float("-inf")
     resume_value = args.resume or str(getattr(cfg.train, "resume", ""))
@@ -451,7 +469,12 @@ def main() -> None:
             scaler=scaler,
             map_location=device,
         )
-        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        checkpoint_epoch = int(checkpoint.get("epoch", -1))
+        if bool(checkpoint.get("epoch_complete", True)):
+            start_epoch = checkpoint_epoch + 1
+        else:
+            start_epoch = checkpoint_epoch
+            resume_batch_index = int(checkpoint.get("next_batch_index", 0))
         global_step = int(checkpoint.get("global_step", 0))
         best_psnr = float(checkpoint.get("best_psnr", best_psnr))
 
@@ -494,6 +517,21 @@ def main() -> None:
             sampler = getattr(train_loader, "sampler", None)
             if distributed and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(epoch)
+            epoch_resume_batch = resume_batch_index if epoch == start_epoch else 0
+            if epoch_resume_batch > 0:
+                if not hasattr(sampler, "set_start_index"):
+                    raise RuntimeError(
+                        "Mid-epoch resume requires ResumableDistributedSampler"
+                    )
+                sampler.set_start_index(epoch_resume_batch * local_batch)
+                rank_print(
+                    f"Resuming epoch {epoch} at batch {epoch_resume_batch:,}"
+                )
+            elif hasattr(sampler, "set_start_index"):
+                sampler.set_start_index(0)
+            epoch_batches = len(train_loader)
+            if args.max_train_batches > 0:
+                epoch_batches = min(epoch_batches, int(args.max_train_batches))
             model.train()
             optimizer.zero_grad(set_to_none=True)
             progress = tqdm(train_loader, desc=f"MoviePairS2 {epoch:03d}", disable=not is_main_process)
@@ -503,10 +541,11 @@ def main() -> None:
                 if args.max_train_batches > 0 and batch_index >= args.max_train_batches:
                     break
                 seen_batches += 1
+                absolute_batch_index = epoch_resume_batch + batch_index
                 content, style, target, views = make_bidirectional_batch(batch, device)
                 alpha = residual_strength(global_step, int(cfg.train.residual_ramp_steps))
                 should_step = (seen_batches % accumulation == 0)
-                is_last = batch_index + 1 >= batches_per_epoch
+                is_last = batch_index + 1 >= epoch_batches
                 sync_context = (
                     model.no_sync()
                     if distributed and not (should_step or is_last)
@@ -593,6 +632,28 @@ def main() -> None:
                             max_items=int(cfg.validation.max_visual_items),
                             title=f"step={global_step} alpha={alpha:.3f}",
                         )
+                    should_save_latest = (
+                        latest_every_steps > 0
+                        and not optimizer_step_was_skipped
+                        and global_step > 0
+                        and global_step % latest_every_steps == 0
+                    )
+                    if should_save_latest:
+                        save_stage2_checkpoint(
+                            paths["checkpoints"] / "latest.pth",
+                            model,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                            epoch,
+                            global_step,
+                            best_psnr,
+                            cfg,
+                            next_batch_index=absolute_batch_index + 1,
+                            epoch_complete=False,
+                        )
+                        if distributed:
+                            dist.barrier()
 
             if seen_batches == 0:
                 raise RuntimeError("Training loader produced no batches")

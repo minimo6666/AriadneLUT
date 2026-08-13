@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from array import array
 import json
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import numpy as np
 from PIL import Image
@@ -13,6 +14,28 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms.functional import pil_to_tensor
 
+
+class ResumableDistributedSampler(DistributedSampler):
+    """Distributed sampler that can resume at a per-rank sample offset."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.start_index = 0
+
+    def set_start_index(self, start_index: int) -> None:
+        value = int(start_index)
+        if value < 0 or value > self.num_samples:
+            raise ValueError(
+                f"start_index must be within [0, {self.num_samples}], got {value}"
+            )
+        self.start_index = value
+
+    def __iter__(self):
+        indices = list(super().__iter__())
+        return iter(indices[self.start_index :])
+
+    def __len__(self) -> int:
+        return max(super().__len__() - self.start_index, 0)
 
 class MovieNetPairDataset(Dataset):
     """MovieNet same-style/different-content pairs with LUT corruption.
@@ -45,49 +68,66 @@ class MovieNetPairDataset(Dataset):
         if self.image_size <= 0:
             raise ValueError("data.image_size must be positive")
 
-        self.records = self._read_manifest(self.manifest_path)
-        if not self.records:
+        self.record_offsets = self._index_manifest(self.manifest_path)
+        self._manifest_handle: BinaryIO | None = None
+        if not self.record_offsets:
             raise RuntimeError(f"No pairs found in {self.manifest_path}")
 
         self.lut_paths = sorted(self.lut_root.rglob("*.cube"))
         if not self.lut_paths:
             raise RuntimeError(f"No .cube LUT files found below {self.lut_root}")
 
-        # Match Stage 1: parse LUTs before DataLoader workers fork so workers
-        # share the read-only tables instead of reparsing all 308 files.
+        # Spawn workers receive these pickle-safe LUTs without inheriting
+        # any CUDA/NCCL process state from the training rank.
         self.luts = [load_cube_file(str(path)) for path in self.lut_paths]
 
     @staticmethod
-    def _read_manifest(path: Path) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    source = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise ValueError(f"Invalid JSON at {path}:{line_number}") from exc
-                missing = [key for key in ("image_a", "image_b") if not source.get(key)]
-                if missing:
-                    raise ValueError(
-                        f"Missing {missing} at {path}:{line_number}"
-                    )
-                records.append(
-                    {
-                        "pair_id": str(source.get("pair_id", line_number - 1)),
-                        "movie_id": str(source.get("movie_id", "")),
-                        "image_a": str(source["image_a"]),
-                        "image_b": str(source["image_b"]),
-                        "proxy_style_score": float(source.get("proxy_style_score", 0.0)),
-                        "csd_style_similarity": float(source.get("csd_style_similarity", 0.0)),
-                        "content_dissimilarity": float(source.get("content_dissimilarity", 0.0)),
-                    }
-                )
-        return records
+    def _index_manifest(path: Path) -> array:
+        """Store compact byte offsets instead of 800k Python dictionaries."""
+        offsets = array("Q")
+        with path.open("rb") as handle:
+            while True:
+                offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip():
+                    offsets.append(offset)
+        return offsets
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_manifest_handle"] = None
+        return state
+
+    def _record_at(self, index: int) -> dict[str, Any]:
+        if self._manifest_handle is None or self._manifest_handle.closed:
+            self._manifest_handle = self.manifest_path.open("rb")
+        self._manifest_handle.seek(int(self.record_offsets[index]))
+        line = self._manifest_handle.readline()
+        try:
+            source = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Invalid JSON at pair index {index} in {self.manifest_path}"
+            ) from exc
+        missing = [key for key in ("image_a", "image_b") if not source.get(key)]
+        if missing:
+            raise ValueError(
+                f"Missing {missing} at pair index {index} in {self.manifest_path}"
+            )
+        return {
+            "pair_id": str(source.get("pair_id", index)),
+            "movie_id": str(source.get("movie_id", "")),
+            "image_a": str(source["image_a"]),
+            "image_b": str(source["image_b"]),
+            "proxy_style_score": float(source.get("proxy_style_score", 0.0)),
+            "csd_style_similarity": float(source.get("csd_style_similarity", 0.0)),
+            "content_dissimilarity": float(source.get("content_dissimilarity", 0.0)),
+        }
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.record_offsets)
 
     def _load_frame(self, path: str) -> Image.Image:
         image_path = Path(path)
@@ -153,7 +193,8 @@ class MovieNetPairDataset(Dataset):
         return pil_to_tensor(image).float().div_(255.0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[int(index)]
+        index = int(index)
+        record = self._record_at(index)
         frame_a_image = self._load_frame(record["image_a"])
         frame_b_image = self._load_frame(record["image_b"])
         corrupted_a_image, lut_a, clipped_a = self._corrupt(
@@ -227,7 +268,7 @@ def build_loader(
     distributed = int(world_size) > 1
     sampler = None
     if distributed:
-        sampler = DistributedSampler(
+        sampler = ResumableDistributedSampler(
             dataset,
             num_replicas=int(world_size),
             rank=int(rank),
@@ -256,6 +297,7 @@ def build_loader(
         persistent_workers=workers > 0 and bool(cfg.data.persistent_workers),
         worker_init_fn=_seed_worker,
         generator=generator,
+        multiprocessing_context="spawn" if workers > 0 else None,
         drop_last=False,
     )
     return loader, dataset
