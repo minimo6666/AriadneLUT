@@ -1,0 +1,48 @@
+# Query-Adaptive Stage-1 overlay.
+# Data, encoder architecture, optimizer, scheduler, batch size, epoch count,
+# fixed visualization pairs, and Neural-Preset reconstruction objective are read
+# from the existing experiment's config.yaml at runtime.
+
+experiment:
+  output_dir: experiments/ariadnet_lut_neural_preset_setting_query_adaptive_stage1/runs/main_gpu2_b24
+
+base_config: experiments/ariadnet_lut_neural_preset_setting/config.yaml
+
+model:
+  common:
+    # Query support is estimated from real pixels only; no resized colors are invented.
+    max_query_pixels: 16384
+    token_hidden_dim: 192
+    token_depth: 2
+    coord_fourier_frequencies: 4
+    shell_decay: 0.35
+    local_smoothing_blend: 0.10
+
+  # Raw/LUT-graded inputs are less sparse than canonical Z_C, so use a slightly
+  # more conservative 99.5% support for the normalization transform.
+  normalization:
+    mass_fraction_16: 0.995
+    mass_fraction_32: 0.995
+    dilation_16: 1
+    dilation_32: 1
+
+  # Canonical queries are empirically extremely sparse (~1.7% at K=32 for
+  # 99%+r1), so the style branch can use the measured 99% operating point.
+  style:
+    mass_fraction_16: 0.99
+    mass_fraction_32: 0.99
+    dilation_16: 1
+    dilation_32: 1
+    use_style_evidence: true
+
+loss:
+  # Kept deliberately light: the original L1 + 10*MSE objective remains dominant.
+  delta_energy: 0.001
+  query_tv: 0.01
+  shell_taper: 0.002
+  coarse_curvature: 0.001
+
+benchmark:
+  warmup: 5
+  repeats: 20
+  max_val_batches: 20
