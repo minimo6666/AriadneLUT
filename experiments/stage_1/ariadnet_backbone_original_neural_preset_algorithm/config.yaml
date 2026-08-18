@@ -1,0 +1,56 @@
+experiment:
+  name: ariadnet_backbone_original_neural_preset_algorithm
+  output_dir: experiments/stage_1/ariadnet_backbone_original_neural_preset_algorithm/runs/main_ddp_gpu01_b272_final
+  seed: 160122
+
+device: cuda
+
+# Identical image encoders and code dimensions to the 3D-LUT Stage-1 baseline.
+# Only the color decoder/application class changes.
+model:
+  encoder_size: 256
+  patch_size: 16
+  hidden_dim: 256
+  depth: 6
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+  normalization_dim: 128
+  style_dim: 128
+  matrix_rank: 16
+
+data:
+  coco_root: /mnt/data/0/mohao/data/coco
+  train_split: train
+  val_split: valid
+  lut_root: /home/minimo/Project/DavinciLUTBaselineComparision/Neural-Preset/datasets/luts
+  image_size: 256
+  global_batch_size: 544
+  batch_history_note: "epoch 0 used 6 GPUs and global batch 1632; epoch 1 onward uses GPUs 0-1 and global batch 544"
+  batch_size_per_gpu: 272
+  num_workers_per_gpu: 8
+  # Large 272-image batches can deadlock the background pinned-memory queue.
+  pin_memory: false
+  persistent_workers: true
+  prefetch_factor: 1
+  deterministic_validation: true
+  validation_seed: 160122
+
+loss:
+  lambda_consistency: 10.0
+
+train:
+  epochs: 32
+  learning_rate: 0.0003
+  beta1: 0.9
+  beta2: 0.999
+  amp: true
+  grad_clip: 0.0
+  log_every_optimizer_steps: 20
+  image_every_optimizer_steps: 500
+  scheduler_step_size: 24
+  scheduler_gamma: 0.1
+  resume: ""
+
+validation:
+  max_visual_items: 2
