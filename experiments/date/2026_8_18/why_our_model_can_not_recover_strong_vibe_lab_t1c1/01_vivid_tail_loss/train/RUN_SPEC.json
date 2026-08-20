@@ -1,0 +1,18 @@
+{
+  "ablation": "vivid_tail_loss",
+  "gpu": 4,
+  "single_changed_factor": "vivid_tail_loss",
+  "lambda_vivid_tail": 1,
+  "epochs": 32,
+  "learning_rate": 0.0003,
+  "seed": 160122,
+  "micro_batch_per_gpu": 28,
+  "gradient_accumulation_steps": 6,
+  "effective_global_batch": 168,
+  "resume": false,
+  "shared_constants": {
+    "lambda_lut_smooth": 0.02,
+    "lambda_gamut": 0.02,
+    "chromatic_scale_multiplier": 0.5
+  }
+}
